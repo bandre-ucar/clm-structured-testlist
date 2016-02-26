@@ -28,8 +28,10 @@ import traceback
 
 if sys.version_info[0] == 2:
     from ConfigParser import SafeConfigParser as config_parser
+    from ConfigParser import Error as config_error
 else:
     from configparser import ConfigParser as config_parser
+    from configparser import Error as config_error
 
 #
 # installed dependencies
@@ -91,66 +93,148 @@ def read_config_file(filename):
 
 
 def write_template_config():
-    """write a template configuration file
+    """write a template configuration file.
+
+    Each section of the configuration file is a different test suite.
+
+    Each section has a 'type' key that defines how it is processed.
+
+      - base : defineds a base simulation for perturbation suites
+
+      - single parameter perturbation : start with the base simulation
+        and perturb it once for each item in each key.
+
+      - one off : a simple list of tests that are included as is
+
+    The keys in each section correspond to the different parts of a
+      cime test name:
+      {test}.{grid}.{compset}.{machine}_{compiler}.{testmod}
+
+    The keys for "one off" are basically meaningless, and can be used
+    for grouping. The values are space delimited lists of fullly
+    qualified test names.
+
     """
     template = config_parser()
 
-    section = 'base'
+    section = 'clm_base'
     template.add_section(section)
+    template.set(section, 'type', '"base"')
     template.set(section, 'compset', 'string')
     template.set(section, 'grid', 'string')
     template.set(section, 'test', 'string')
     template.set(section, 'testmods', 'string')
+    template.set(section, 'machine', 'string')
+    template.set(section, 'compiler', 'string')
 
-    section = 'single_param_perturbation'
+    section = 'clm_spp'
     template.add_section(section)
+    template.set(section, 'type', '"single param perturbation"')
     template.set(section, 'compset', 'space separated list')
     template.set(section, 'grid', 'space separated list')
     template.set(section, 'test', 'space separated list')
     template.set(section, 'testmods', 'space separated list')
+    template.set(section, 'machine', 'string')
+    template.set(section, 'compiler', 'string')
+
+    section = 'clm_long'
+    template.add_section(section)
+    template.set(section, 'type', '"one off"')
+    template.set(section, 'tests', 'space separated list')
 
     with open('template.cfg', 'wb') as configfile:
         template.write(configfile)
+
 
 # -------------------------------------------------------------------------------
 #
 # work functions
 #
 # -------------------------------------------------------------------------------
-def setup_base_simulation(config):
+def process_test_config(config, file_base):
     """
     """
-    section = 'base'
+    base_def = None
+    # search for a base section
+    for s in config.sections():
+        config_type = config.get(s, 'type').strip('"')
+        if config_type == 'base':
+            base_def = setup_base_simulation(config, s)
+            removed = config.remove_section(s)
+
+    for s in config.sections():
+        testlist = []
+        testlist.append(copy.deepcopy(base_def))
+        config_type = config.get(s, 'type').strip('"')
+        if config_type == 'single parameter perturbation':
+            setup_single_parameter_perturbations(config, s, base_def, testlist)
+        elif config_type == 'one off':
+            setup_one_off(config, s, testlist)
+        else:
+            msg = "Section {0} has unknown type {1}".format(s, config_type)
+            raise RuntimeError(msg)
+
+        filename = '{0}.{1}.testlist.txt'.format(file_base, s)
+        write_testlist(filename, testlist)
+
+
+def setup_base_simulation(config, section):
+    """
+    """
+    config.remove_option(section, 'type')
     test_def = {}
-    test_def['test'] = config.get(section, 'test')
-    test_def['grid'] = config.get(section, 'grid')
-    test_def['compset'] = config.get(section, 'compset')
-    test_def['testmods'] = config.get(section, 'testmods')
-    test_def['machine'] = 'any'
-    test_def['compiler'] = 'any'
+    for option in config.options(section):
+        test_def[option] = config.get(section, option)
 
     base = test_template.safe_substitute(test_def)
-    print("base test : {0}".format(base))
     return test_def
 
 
-def setup_single_parameter_perturbations(config, base_def, testlist):
+def setup_single_parameter_perturbations(config, section, base_def, testlist):
     """
     """
-    section = 'single_param_perturbation'
+    config.remove_option(section, 'type')
+    machine = config.get(section, 'machine')
+    config.remove_option(section, 'machine')
+    compiler = config.get(section, 'compiler')
+    config.remove_option(section, 'compiler')
     for option in config.options(section):
         items = config.get(section, option)
         items = items.split()
         for item in items:
             test_def = copy.deepcopy(base_def)
             test_def[option] = item
-            #print(test_def)
+            test_def['machine'] = machine
+            test_def['compiler'] = compiler
+            # print(test_def)
+            testlist.append(test_def)
+
+
+def setup_one_off(config, section, testlist):
+    """
+    """
+    config.remove_option(section, 'type')
+    for option in config.options(section):
+        items = config.get(section, option)
+        items = items.split()
+        for item in items:
+            test_def = {}
+            test_data = item.split('.')
+            test_def['test'] = test_data[0]
+            test_def['grid'] = test_data[1]
+            test_def['compset'] = test_data[2]
+            mach_comp = test_data[3].split('_')
+            test_def['machine'] = mach_comp[0]
+            test_def['compiler'] = mach_comp[1]
+            test_def['testmods'] = test_data[4]
+            # print(test_def)
             testlist.append(test_def)
 
 
 def write_testlist(filename, testlist):
     """
     """
+    print('Writing test list to: {0}'.format(filename))
     with open(filename, 'w') as output:
         for t in testlist:
             output.write("{0}\n".format(test_template.safe_substitute(t)))
@@ -167,18 +251,14 @@ def main(options):
         write_template_config()
         return 0
 
-    for config_file in options.test_suite_config:
-        testlist = []
-        config = read_config_file(config_file)
+    for filename in options.test_suite_config:
         try:
-            base_def = setup_base_simulation(config)
-            testlist.append(copy.deepcopy(base_def))
-            setup_single_parameter_perturbations(config, base_def, testlist)
-            filename = config_file.split('.')[0]
-            filename = '{0}.testlist.txt'.format(filename)
-            write_testlist(filename, testlist)
-
-        except ConfigParser.Error as e:
+            # assume we are running in the same directory, strip off
+            # the extension.
+            file_base = filename.split('.')[0]
+            config = read_config_file(filename)
+            process_test_config(config, file_base)
+        except config_error as e:
             print(e)
             return 1
     return 0
