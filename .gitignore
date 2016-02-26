@@ -1,0 +1,12 @@
+# editor files
+*.swp
+*~
+
+# mac files
+.DS_Store
+
+# generated files
+template.cfg
+*.testlist.txt
+
+
